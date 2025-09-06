@@ -1,0 +1,871 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { currentUser } from '@/lib/auth';
+import { db } from '@/lib/db';
+import { PostSchema } from '@/schemas';
+import { zValidator } from '@hono/zod-validator';
+import { Gender } from '@prisma/client';
+import { endOfDay, startOfDay } from 'date-fns';
+import { Hono } from 'hono';
+import { cookies } from 'next/headers';
+import { z } from 'zod';
+
+const app = new Hono()
+  .get(
+    '/',
+    zValidator(
+      'query',
+      z.object({
+        page: z
+          .string()
+          .regex(/^\d+$/)
+          .transform(Number)
+          .default('1')
+          .refine((n) => n > 0, {
+            message: 'Page must be greater than 0',
+          }),
+        preference: z.nativeEnum(Gender).optional(),
+        id: z.string().optional(),
+      })
+    ),
+    async (c) => {
+      const { page, preference, id } = c.req.valid('query');
+      const limit = 10;
+      const skip = (page - 1) * limit;
+
+      // Get user from auth
+      const user = await currentUser();
+
+      // Build base filter - this is used for both count and fetch queries
+      const baseFilter: any = {
+        approvalStatus: 'APPROVED',
+      };
+
+      // Add preference filter if provided
+      if (preference) {
+        baseFilter.creator = { gender: preference };
+      }
+
+      // Track user history for both auth and non-auth users
+      let votedPostIds: string[] = [];
+      let viewedPostIds: string[] = [];
+      const impressionMap: Map<string, Date> = new Map();
+
+      // Get previously seen post IDs from session storage
+      const sessionStore = cookies();
+      const seenPostsKey = user ? `seenPosts_${user.id}` : 'seenPosts_anon';
+      const seenPostsCookie = sessionStore.get(seenPostsKey);
+      let previouslySeenPosts: string[] = [];
+
+      if (seenPostsCookie) {
+        try {
+          previouslySeenPosts = JSON.parse(seenPostsCookie.value);
+          if (!Array.isArray(previouslySeenPosts)) {
+            previouslySeenPosts = [];
+          }
+        } catch (e) {
+          console.error('Error parsing seenPosts cookie:', e);
+          previouslySeenPosts = [];
+        }
+      }
+
+      // Handle auth user specific data fetching
+      if (user) {
+        // Fetch user's voted posts and exclude them (more efficient select)
+        const votedPosts = await db.vote.findMany({
+          where: { voterId: user.id },
+          select: { postId: true },
+        });
+        votedPostIds = votedPosts.map((vote) => vote.postId);
+
+        // Get recent impressions (for scoring and avoiding repeats)
+        const thirtyDaysAgo = new Date();
+        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+        const userImpressions = await db.postImpression.findMany({
+          where: {
+            userId: user.id,
+            viewedAt: { gte: thirtyDaysAgo },
+          },
+          select: { postId: true, viewedAt: true },
+          orderBy: { viewedAt: 'desc' },
+          take: 200, // Limit how many impressions we consider
+        });
+
+        // Create a map for faster lookups
+        userImpressions.forEach((imp) => {
+          impressionMap.set(imp.postId, new Date(imp.viewedAt));
+        });
+
+        // Get list of recently viewed post IDs
+        viewedPostIds = userImpressions.map((imp) => imp.postId);
+      } else {
+        // For anonymous users, get viewed posts from cookies
+        const viewedPostsCookie = cookies().get('viewedPosts');
+
+        if (viewedPostsCookie) {
+          try {
+            viewedPostIds = JSON.parse(viewedPostsCookie.value);
+            if (!Array.isArray(viewedPostIds)) {
+              viewedPostIds = [];
+            }
+          } catch (e) {
+            console.error('Error parsing viewedPosts cookie:', e);
+            viewedPostIds = [];
+          }
+        }
+      }
+
+      // Combine all post IDs to exclude
+      const excludePostIds = [
+        ...new Set([...votedPostIds, ...previouslySeenPosts]),
+      ];
+
+      // Build auth filter with exclusions
+      const authFilter = {
+        ...baseFilter,
+        ...(excludePostIds.length > 0 && { id: { notIn: excludePostIds } }),
+        ...(user && { creatorId: { not: user.id } }),
+      };
+
+      // Include specific post if ID is provided
+      let requestedPost: any = null;
+      if (id) {
+        requestedPost = await db.post.findFirst({
+          where: { AND: [{ id }, { creatorId: { not: user?.id } }] },
+          include: {
+            creator: true,
+            _count: { select: { vote: true } },
+            comment: true,
+            vote: {
+              include: { voter: true },
+              take: 3,
+            },
+          },
+        });
+      
+
+      // First try to get posts that user hasn't seen
+      const fetchMultiplier = 5; // Fetch 5x the posts we need
+      const [candidatePosts, total] = await Promise.all([
+        db.post.findMany({
+          where: authFilter,
+          include: {
+            creator: { select: { id: true, gender: true, name: true, image: true },},
+            _count: { select: { vote: true, comment: true } },
+          },
+          take: Math.min(limit * 2, 20), // Cap at 20 to prevent excessive DB load
+          skip,
+          orderBy: [
+            { createdAt: 'desc' }, // Prioritize newer content
+            { weightedRating: 'desc' }, // Higher rated content
+          ],
+        }),
+        db.post.count({ where: authFilter }),
+      ]);
+
+      // If no unseen posts are available, get random posts
+      let randomPosts: any[] = [];
+      if (candidatePosts.length === 0) {
+        // Only exclude self-created posts for authenticated users
+        const randomFilter = {
+          ...baseFilter,
+          ...(user && { creatorId: { not: user.id } }),
+          ...(votedPostIds.length > 0 && { id: { notIn: votedPostIds } }), // Add this line
+        };
+
+        // Get the total count first to determine how many posts exist
+        const totalPostCount = await db.post.count({ where: randomFilter });
+
+        if (totalPostCount > 0) {
+          // Calculate how many posts to skip to get a random slice
+          // Using a random offset for true randomization
+          const maxSkip = Math.max(0, totalPostCount - limit);
+          const randomSkip =
+            maxSkip > 0 ? Math.floor(Math.random() * maxSkip) : 0;
+
+          randomPosts = await db.post.findMany({
+            where: randomFilter,
+            include: {
+              creator: {
+                select: { id: true, gender: true, name: true, image: true },
+              },
+              _count: { select: { vote: true } },
+              comment: true,
+   
+            },
+            take: limit * 2, // Fetch more than needed for diversity algorithm
+            skip: randomSkip,
+          });
+
+          // Shuffle the posts for true randomness
+          randomPosts = randomPosts.sort(() => Math.random() - 0.5);
+        }
+      }
+
+      // Combine candidate posts with random posts (if needed)
+      const allCandidates = [...candidatePosts, ...randomPosts];
+      // If still no posts, return 200
+      if (allCandidates.length === 0) {
+        return c.json(
+          {
+            message: 'No posts available',
+            data: [],
+            hasMore: false,
+            nextPage: page,
+          },
+          200
+        );
+      }
+
+      // Process and score posts
+      const processedPosts = allCandidates.map((post) => {
+        // Calculate a recency score (higher = less recently viewed)
+        let recencyScore = 100; // Default high score for never viewed
+        let viewedRecently = false;
+        let daysSinceLastView = 30; // Default to 30 days if never viewed
+
+        if (impressionMap.has(post.id)) {
+          const lastViewed = impressionMap.get(post.id)!;
+          daysSinceLastView = Math.floor(
+            (new Date().getTime() - lastViewed.getTime()) /
+              (1000 * 60 * 60 * 24)
+          );
+
+          // Exponential decay function - score increases as days pass
+          recencyScore = Math.min(
+            100,
+            Math.floor(20 * Math.log(daysSinceLastView + 1))
+          );
+
+          // Mark as recently viewed if seen in the last 3 days
+          if (daysSinceLastView < 3) {
+            viewedRecently = true;
+          }
+        } else if (viewedPostIds.includes(post.id)) {
+          // For anonymous users
+          recencyScore = 25;
+          viewedRecently = true;
+          daysSinceLastView = 1; // Assume recently viewed
+        }
+
+        // Add significant randomness factor (0-60)
+        // Higher randomness for random fallback posts to ensure variety
+        const randomFactor = Math.random() * 60;
+
+        // Weight quality and recency
+        const qualityWeight = (post._count.vote || 0) / 5; // Up to 20 points for 100 votes
+
+        // Assign higher scores to posts not viewed recently
+        const recencyBonus = daysSinceLastView * 2; // 2 points per day since last view
+
+        return {
+          ...post,
+          recencyScore,
+          viewedRecently,
+          daysSinceLastView,
+          // Combine scores with significant randomness
+          combinedScore:
+            recencyScore + qualityWeight + randomFactor + recencyBonus,
+        };
+      });
+
+      // Apply a Fisher-Yates shuffle for true randomization
+      const shuffle = (array: any[]) => {
+        for (let i = array.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [array[i], array[j]] = [array[j], array[i]];
+        }
+        return array;
+      };
+
+      // Group posts by recency (recently viewed vs not)
+      const recentlyViewed = processedPosts.filter((p) => p.viewedRecently);
+      const notRecentlyViewed = processedPosts.filter((p) => !p.viewedRecently);
+
+      // Shuffle both groups separately
+      shuffle(recentlyViewed);
+      shuffle(notRecentlyViewed);
+
+      // Sort not recently viewed by score, but keep shuffle order within score bands
+      notRecentlyViewed.sort((a, b) => {
+        // Round scores to nearest 10 to create score bands
+        const aBand = Math.floor(a.combinedScore / 10);
+        const bBand = Math.floor(b.combinedScore / 10);
+
+        if (aBand === bBand) return 0; // Keep shuffle order within bands
+        return bBand - aBand; // Higher bands first
+      });
+
+      // For recently viewed posts, prioritize those seen longest ago
+      recentlyViewed.sort((a, b) => b.daysSinceLastView - a.daysSinceLastView);
+
+      // Prioritize not recently viewed, then add recently viewed at the end
+      const sortedPosts = [...notRecentlyViewed, ...recentlyViewed];
+
+      // Create final posts array enforcing creator diversity
+      const finalPosts: any[] = [];
+      const seenCreators = new Set<string>();
+      const lastThreeCreators: string[] = [];
+
+      // Add requested post first if specified
+      if (requestedPost) {
+        finalPosts.push(requestedPost);
+        seenCreators.add(requestedPost.creatorId);
+        lastThreeCreators.push(requestedPost.creatorId);
+      }
+
+      // Select posts ensuring creator diversity
+      for (const post of sortedPosts) {
+        // Skip if already included
+        if (finalPosts.some((p) => p.id === post.id)) continue;
+
+        // Skip if this creator appears in the last 2 posts (prevents back-to-back)
+        if (lastThreeCreators.slice(-2).includes(post.creatorId)) continue;
+
+        // Skip if this would make 3 posts from same creator in the final set
+        const creatorPostCount = finalPosts.filter(
+          (p) => p.creatorId === post.creatorId
+        ).length;
+        if (creatorPostCount >= 2) continue;
+
+        // Add post
+        finalPosts.push(post);
+        lastThreeCreators.push(post.creatorId);
+
+        // Keep lastThreeCreators to the last 3 entries
+        if (lastThreeCreators.length > 3) {
+          lastThreeCreators.shift();
+        }
+
+        // Break when we have enough
+        if (finalPosts.length >= limit) break;
+      }
+
+      // If we don't have enough posts yet, try again with less strict rules
+      if (finalPosts.length < limit) {
+        for (const post of sortedPosts) {
+          // Skip if already included
+          if (finalPosts.some((p) => p.id === post.id)) continue;
+
+          // Only avoid immediate back-to-back posts from same creator
+          if (lastThreeCreators.slice(-1)[0] === post.creatorId) continue;
+
+          finalPosts.push(post);
+          lastThreeCreators.push(post.creatorId);
+
+          if (lastThreeCreators.length > 3) {
+            lastThreeCreators.shift();
+          }
+
+          if (finalPosts.length >= limit) break;
+        }
+      }
+
+      // If still less than limit, add any remaining posts
+      if (finalPosts.length < limit) {
+        for (const post of sortedPosts) {
+          // Skip if already included
+          if (finalPosts.some((p) => p.id === post.id)) continue;
+
+          finalPosts.push(post);
+
+          if (finalPosts.length >= limit) break;
+        }
+      }
+
+      // Determine if this was a fallback to random posts
+      const usedRandomFallback =
+        candidatePosts.length === 0 && randomPosts.length > 0;
+
+      // Update seen posts list for future queries
+      // Only update if we're not in random fallback mode
+      if (!usedRandomFallback) {
+        const newlySeenPostIds = finalPosts.map((post) => post.id);
+        const allSeenPosts = [
+          ...newlySeenPostIds,
+          ...previouslySeenPosts,
+        ].slice(0, 100);
+
+        // Store the updated seen posts in the session
+        cookies().set({
+          name: seenPostsKey,
+          value: JSON.stringify(allSeenPosts),
+          httpOnly: true,
+          secure: process.env.NODE_ENV === 'production',
+          maxAge: 60 * 60, // 1 hour for session storage
+          sameSite: 'lax',
+          path: '/',
+        });
+      }
+
+      // Batch update impressions in a single transaction
+      const newlySeenPostIds = finalPosts.map((post) => post.id);
+      await db.$transaction(async (tx) => {
+        // Bulk update impression counts
+        if (newlySeenPostIds.length > 0) {
+          await tx.post.updateMany({
+            where: { id: { in: newlySeenPostIds } },
+            data: { impressions: { increment: 1 } },
+          });
+        }
+
+        // Record impressions for authenticated users
+        if (user && newlySeenPostIds.length > 0) {
+          const now = new Date();
+          await tx.postImpression.createMany({
+            data: newlySeenPostIds.map((postId) => ({
+              postId,
+              userId: user.id,
+              viewedAt: now,
+            })),
+            skipDuplicates: true,
+          });
+        }
+      });
+
+      // Update cookie for anonymous users
+      if (!user) {
+        const updatedViewedPosts = [
+          ...newlySeenPostIds,
+          ...viewedPostIds,
+        ].slice(0, 100); // Limit size
+
+        cookies().set({
+          name: 'viewedPosts',
+          value: JSON.stringify(updatedViewedPosts),
+          httpOnly: true,
+          secure: process.env.NODE_ENV === 'production',
+          maxAge: 30 * 24 * 60 * 60, // 30 days
+          sameSite: 'lax',
+          path: '/',
+        });
+      }
+
+      // Clean up posts before returning
+      const cleanPosts = finalPosts.map((post) => {
+        // Use destructuring to remove scoring fields
+        const {
+          recencyScore,
+          combinedScore,
+          viewedRecently,
+          daysSinceLastView,
+          ...cleanPost
+        } = post;
+        return cleanPost;
+      });
+
+      const hasMore = usedRandomFallback ? false : skip + limit < total;
+
+      return c.json({
+        data: cleanPosts,
+        hasMore: true,
+        nextPage: !hasMore ? 1 : usedRandomFallback ? 1 : page + 1,
+        isRandomized: usedRandomFallback,
+      });
+    }
+  )
+  .get('/top-creators-today', async (c) => {
+    // Get the start and end of the current day
+    const todayStart = startOfDay(new Date());
+    const todayEnd = endOfDay(new Date());
+
+    // First, get all posts updated today with their engagement metrics
+    const todayPosts = await db.post.findMany({
+      where: {
+        AND: [
+          {
+            updatedAt: {
+              gte: todayStart,
+              lte: todayEnd,
+            },
+          },
+          {
+            approvalStatus: 'APPROVED',
+          },
+        ],
+      },
+      include: {
+        creator: {
+          select: {
+            id: true,
+            name: true,
+            image: true,
+            isVerified: true,
+            activityScore: true,
+            votingPattern: true,
+            gender: true,
+            dateOfBirth: true,
+          },
+        },
+        _count: {
+          select: {
+            vote: true,
+            comment: true,
+          },
+        },
+        vote: {
+          select: {
+            weight: true,
+            userWeight: true,
+            contextWeight: true,
+            rating: true,
+            isOutlier: false,
+          },
+          where: {
+            isOutlier: false,
+          },
+        },
+      },
+    });
+
+    // Calculate engagement score for each post using weighted algorithm
+    const postsWithScores = todayPosts.map((post) => {
+      // Use vote weights from the voting algorithm
+      const weightedVotes = post.vote.reduce(
+        (acc, vote) => acc + vote.rating * vote.weight,
+        0
+      );
+
+      const totalVoteWeight =
+        post.vote.reduce((acc, vote) => acc + vote.weight, 0) || 1; // Avoid division by zero
+
+      // Calculate weighted average rating
+      const weightedAverageRating =
+        post.vote.length > 0
+          ? weightedVotes / totalVoteWeight
+          : post.averageRating;
+
+      // Creator reputation factor based on verification status and activity score
+      const creatorFactor = post.creator.isVerified ? 1.2 : 1.0;
+      const activityBonus = Math.min(post.creator.activityScore * 0.001, 0.5);
+
+      // Calculate enhanced engagement score
+      const voteWeight = 2; // Each vote is worth 2 points
+      const commentWeight = 3; // Each comment is worth 3 points
+      const impressionWeight = 0.5; // Each impression is worth 0.5 points
+      const ratingMultiplier = 5; // Multiply rating by 5 to give it more weight
+
+      // Use vote weight to calculate vote score (incorporating vote quality)
+      const voteScore =
+        post._count.vote *
+        voteWeight *
+        (totalVoteWeight / post._count.vote || 1);
+      const commentScore = post._count.comment * commentWeight;
+      const impressionScore = post.impressions * impressionWeight;
+      const ratingScore = weightedAverageRating * ratingMultiplier;
+
+      // Combined score considers weighted factors
+      const engagementScore =
+        (voteScore + commentScore + impressionScore + ratingScore) *
+        (creatorFactor + activityBonus);
+
+      return {
+        ...post,
+        engagementScore,
+        weightedAverageRating,
+        creatorId: post.creator.id,
+        creatorWeight: creatorFactor + activityBonus,
+      };
+    });
+
+    // Sort posts by engagement score
+    const topPosts = postsWithScores
+      .sort((a, b) => b.engagementScore - a.engagementScore)
+      .slice(0, 3);
+
+    // If we have exactly 3 top posts today, return them
+    if (topPosts.length === 3) {
+      return c.json({
+        data: topPosts.map((post) => ({
+          id: post.id,
+          caption: post.caption,
+          image: post.image,
+          creator: post.creator,
+          engagementScore: post.engagementScore,
+          weightedRating: post.weightedAverageRating,
+          totalVotes: post._count.vote,
+          totalComments: post._count.comment,
+          impressions: post.impressions,
+        })),
+        message: "Top 3 posts based on today's engagement and vote quality",
+      });
+    }
+
+    // If we have fewer than 3, get additional recent top posts
+    if (topPosts.length < 3) {
+      // Get post IDs to exclude from the supplemental query
+      const existingPostIds = topPosts.map((post) => post.id);
+
+      // Get recent top posts from previous days, using weightedRating
+      // which already incorporates vote quality from the voting algorithm
+      const recentPosts = await db.post.findMany({
+        where: {
+          AND: [
+            {
+              approvalStatus: 'APPROVED',
+            },
+            {
+              id: {
+                notIn: existingPostIds,
+              },
+            },
+            // Exclude posts from today
+            {
+              createdAt: {
+                lt: todayStart,
+              },
+            },
+          ],
+        },
+        include: {
+          creator: {
+            select: {
+              id: true,
+              name: true,
+              image: true,
+              isVerified: true,
+              activityScore: true,
+              votingPattern: true,
+              gender: true,
+              dateOfBirth: true,
+            },
+          },
+          _count: {
+            select: {
+              vote: true,
+              comment: true,
+            },
+          },
+          vote: {
+            select: {
+              weight: true,
+              userWeight: true,
+              contextWeight: true,
+              rating: true,
+              isOutlier: false,
+            },
+            where: {
+              isOutlier: false,
+            },
+          },
+        },
+        orderBy: [{ weightedRating: 'desc' }, { createdAt: 'desc' }],
+        take: 20, // Take more posts to ensure we have quality options
+      });
+
+      // Calculate engagement scores for recent posts using the same algorithm
+      const recentPostsWithScores = recentPosts.map((post) => {
+        // Use vote weights from the voting algorithm
+        const weightedVotes = post.vote.reduce(
+          (acc, vote) => acc + vote.rating * vote.weight,
+          0
+        );
+
+        const totalVoteWeight =
+          post.vote.reduce((acc, vote) => acc + vote.weight, 0) || 1;
+
+        // Calculate weighted average rating
+        const weightedAverageRating =
+          post.vote.length > 0
+            ? weightedVotes / totalVoteWeight
+            : post.averageRating;
+
+        // Creator reputation factor
+        const creatorFactor = post.creator.isVerified ? 1.2 : 1.0;
+        const activityBonus = Math.min(post.creator.activityScore * 0.001, 0.5);
+
+        // Apply recency penalty to older content
+        const daysSinceCreation = Math.max(
+          1,
+          Math.ceil(
+            (Date.now() - post.createdAt.getTime()) / (1000 * 60 * 60 * 24)
+          )
+        );
+        const recencyFactor = Math.max(
+          0.5,
+          1 - Math.log10(daysSinceCreation) * 0.1
+        );
+
+        // Calculate enhanced engagement score with recency penalty
+        const voteWeight = 2;
+        const commentWeight = 3;
+        const impressionWeight = 0.5;
+        const ratingMultiplier = 5;
+
+        const voteScore =
+          post._count.vote *
+          voteWeight *
+          (totalVoteWeight / post._count.vote || 1);
+        const commentScore = post._count.comment * commentWeight;
+        const impressionScore = post.impressions * impressionWeight;
+        const ratingScore = weightedAverageRating * ratingMultiplier;
+
+        const engagementScore =
+          (voteScore + commentScore + impressionScore + ratingScore) *
+          (creatorFactor + activityBonus) *
+          recencyFactor;
+
+        return {
+          ...post,
+          engagementScore,
+          weightedAverageRating,
+          recencyFactor,
+          creatorWeight: creatorFactor + activityBonus,
+        };
+      });
+
+      // Sort by engagement score and take needed number
+      const topRecentPosts = recentPostsWithScores
+        .sort((a, b) => b.engagementScore - a.engagementScore)
+        .slice(0, 3 - topPosts.length);
+
+      // Combine today's top posts with supplemental posts
+      const combinedTopPosts = [...topPosts, ...topRecentPosts];
+
+      // Format posts for response
+      const formattedPosts = combinedTopPosts.map((post) => ({
+        id: post.id,
+        caption: post.caption,
+        image: post.image,
+        creator: post.creator,
+        engagementScore: post.engagementScore,
+        weightedRating: post.weightedAverageRating || post.averageRating,
+        totalVotes: post._count.vote,
+        totalComments: post._count.comment,
+        impressions: post.impressions,
+        recent: post.hasOwnProperty('recencyFactor') ? true : false,
+      }));
+
+      return c.json({
+        data: formattedPosts,
+        message:
+          topPosts.length === 0
+            ? 'No top posts today. Showing recent top posts based on weighted engagement.'
+            : `Showing ${topPosts.length} top post(s) from today and ${topRecentPosts.length} recent top post(s).`,
+      });
+    }
+
+    // This code should never be reached, but included for safety
+    return c.json({
+      data: topPosts.map((post) => ({
+        id: post.id,
+        caption: post.caption,
+        image: post.image,
+        creator: post.creator,
+        engagementScore: post.engagementScore,
+        weightedRating: post.weightedAverageRating,
+        totalVotes: post._count.vote,
+        totalComments: post._count.comment,
+        impressions: post.impressions,
+      })),
+      message: 'Top posts based on engagement and vote quality',
+    });
+  })
+  .get(
+    '/:id',
+    zValidator('param', z.object({ id: z.string().optional() })),
+    async (c) => {
+      const postId = c.req.param('id');
+
+      if (!postId) {
+        return c.json({ error: 'Missing id!' }, 400);
+      }
+
+      const post = await db.post.findUnique({
+        where: {
+          id: postId,
+        },
+        include: {
+          _count: {
+            select: {
+              vote: true,
+            },
+          },
+          creator: true,
+          vote: {
+            include: {
+              voter: true,
+            },
+          },
+        },
+      });
+
+      if (!post) {
+        return c.json({ message: 'Post not found' }, 404);
+      }
+
+      return c.json({ success: true, data: post }, 200);
+    }
+  )
+  .post('/', zValidator('json', PostSchema), async (c) => {
+    const data = c.req.valid('json');
+
+    const user = await currentUser();
+
+    if (!user || !user?.id) {
+      return c.json({ message: 'Unauthorized' }, 401);
+    }
+
+    const post = await db.post.create({
+      data: {
+        creatorId: user.id,
+
+        ...data,
+      },
+    });
+
+    return c.json(
+      {
+        success: true,
+        data: post,
+      },
+      201
+    );
+  })
+  .delete(
+    '/:id',
+    zValidator('param', z.object({ id: z.string().optional() })),
+    async (c) => {
+      const postId = c.req.param('id');
+
+      if (!postId) {
+        return c.json({ error: 'Missing id!' }, 400);
+      }
+
+      const user = await currentUser();
+
+      if (!user || !user?.id) {
+        return c.json({ message: 'Unauthorized' }, 401);
+      }
+
+      const post = await db.post.findUnique({
+        where: {
+          id: postId,
+        },
+      });
+
+      if (!post) {
+        return c.json({ message: 'Post not found' }, 404);
+      }
+
+      if (post.creatorId !== user.id) {
+        return c.json(
+          { message: 'You are not authorized to delete this post' },
+          401
+        );
+      }
+
+      await db.post.delete({
+        where: {
+          id: postId,
+        },
+      });
+
+      return c.json(
+        { success: true, message: 'Post deleted Successfully!' },
+        200
+      );
+    }
+  );
+
+export default app;

@@ -1,0 +1,23 @@
+import { useQuery } from '@tanstack/react-query';
+
+import { QUERY_KEYS } from '@/constants/query-keys';
+import { client } from '@/lib/hono';
+
+export const useGetPost = (id?: string) => {
+  const query = useQuery({
+    enabled: !!id,
+    queryKey: [QUERY_KEYS.POST, { id }],
+    queryFn: async () => {
+      const response = await client.api.post[":id"]['$get']({ param: { id } });
+
+      if (!response.ok) {
+        throw new Error('Failed to fetch post');
+      }
+
+      const { data } = await response.json();
+      return data;
+    },
+  });
+
+  return query;
+};
