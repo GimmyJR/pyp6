@@ -110,10 +110,15 @@ body {
 }
 
 .bg-gradient-image {
-  background: url('/1.png');
-  background-repeat: no-repeat;
-  background-size: cover;
-  background-position: center;
+  background: radial-gradient(
+    circle at center,
+    #2b1a22 0%,
+    #231519 20%,
+    #1a1118 40%,
+    #110d10 60%,
+    #0d0a0c 75%,
+    #050405 100%
+  );
 }
 
 .rdp-vhidden {
