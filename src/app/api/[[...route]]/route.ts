@@ -67,23 +67,20 @@ const routes = app
         return c.json({ error: 'User not found' }, 404);
       }
 
-      // Calculate user stats
-      let userPosts = [];
+      // Calculate user stats via aggregate for performance
+      let averageRating = 0;
+      let receivedVotes = 0;
       try {
-        userPosts = await db.post.findMany({
+        const agg = await db.post.aggregate({
           where: { creatorId: user.id },
-          select: { averageRating: true, totalVotes: true },
+          _avg: { averageRating: true },
+          _sum: { totalVotes: true },
         });
+        averageRating = agg._avg.averageRating ?? 0;
+        receivedVotes = agg._sum.totalVotes ?? 0;
       } catch (postsError) {
-        console.error('❌ Error fetching user posts:', postsError);
-        userPosts = []; // Continue with empty posts if this fails
+        console.error('❌ Error aggregating user posts:', postsError);
       }
-
-      const averageRating = userPosts.length > 0 
-        ? userPosts.reduce((acc, post) => acc + post.averageRating, 0) / userPosts.length
-        : 0;
-
-      const receivedVotes = userPosts.reduce((acc, post) => acc + post.totalVotes, 0);
 
       // Calculate percentile stat
       let percentileStat = 0;
@@ -123,6 +120,7 @@ const routes = app
         },
       };
 
+      c.header('Cache-Control', 'private, max-age=60');
       return c.json({ data });
     } catch (error) {
       console.error('💥 Unexpected error in user profile endpoint:', error);
@@ -186,6 +184,7 @@ const routes = app
         orderBy: { createdAt: 'desc' },
       });
 
+      c.header('Cache-Control', 'private, max-age=30');
       return c.json({ data: posts });
     } catch (error) {
       console.error('Error fetching user posts:', error);
@@ -227,6 +226,7 @@ const routes = app
         },
       };
 
+      c.header('Cache-Control', 'private, max-age=120');
       return c.json({ data });
     } catch (error) {
       console.error('Error fetching next milestone:', error);
@@ -275,7 +275,7 @@ routes.get('/post', async (c) => {
           _count: { select: { votes: true } },
           votes: {
             orderBy: { createdAt: 'desc' },
-            take: 5,
+            take: 3,
             include: { voter: { select: { id: true, name: true, image: true } } },
           },
         },
@@ -299,6 +299,7 @@ routes.get('/post', async (c) => {
     ].map(mapPost);
 
     const hasMore = skip + limit < total;
+    c.header('Cache-Control', 'private, max-age=30');
     return c.json({ data, hasMore, nextPage: hasMore ? page + 1 : page });
   } catch (error: any) {
     console.error('Error fetching posts:', error);
@@ -373,6 +374,7 @@ routes.get('/post/top-creators-today', async (c) => {
         impressions: p.impressions ?? 0,
       }));
 
+    c.header('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
     return c.json({ data: scored });
   } catch (error: any) {
     console.error('Error fetching top creators today:', error);
