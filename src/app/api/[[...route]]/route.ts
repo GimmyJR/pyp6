@@ -31,27 +31,14 @@ async function getCurrentUser(req: Request) {
   }
 }
 
-// User routes
-const userRoutes = app
+// User routes and others
+const routes = app
   .get('/user/profile', async (c) => {
     try {
-      console.log('🔍 Starting user profile fetch...');
-      
-      // Test database connection first
-      try {
-        await db.$connect();
-        console.log('✅ Database connected successfully');
-      } catch (dbError) {
-        console.error('❌ Database connection failed:', dbError);
-        return c.json({ error: 'Database connection failed', details: dbError.message }, 500);
-      }
-
       // Get user from JWT token
       const user = await getCurrentUser(c.req.raw);
-      console.log('👤 Current user:', user ? `${user.id} (${user.email})` : 'null');
       
       if (!user || !user.id) {
-        console.log('🚫 User not authenticated');
         return c.json({ error: 'Unauthorized - Please sign in first' }, 401);
       }
 
@@ -70,7 +57,6 @@ const userRoutes = app
             },
           },
         });
-        console.log('👤 User profile found:', userProfile ? 'yes' : 'no');
       } catch (profileError) {
         console.error('❌ Error fetching user profile:', profileError);
         return c.json({ error: 'Failed to fetch user profile', details: profileError.message }, 500);
@@ -88,7 +74,6 @@ const userRoutes = app
           where: { creatorId: user.id },
           select: { averageRating: true, totalVotes: true },
         });
-        console.log('📝 User posts count:', userPosts.length);
       } catch (postsError) {
         console.error('❌ Error fetching user posts:', postsError);
         userPosts = []; // Continue with empty posts if this fails
@@ -112,7 +97,6 @@ const userRoutes = app
           },
         });
         percentileStat = totalUsers > 0 ? Math.round((betterThanCount / totalUsers) * 100) : 0;
-        console.log('📊 Stats calculated - Total users:', totalUsers, 'Percentile:', percentileStat);
       } catch (statsError) {
         console.error('⚠️ Error calculating stats:', statsError);
       }
@@ -139,7 +123,6 @@ const userRoutes = app
         },
       };
 
-      console.log('✅ Profile data prepared successfully');
       return c.json({ data });
     } catch (error) {
       console.error('💥 Unexpected error in user profile endpoint:', error);
@@ -251,7 +234,153 @@ const userRoutes = app
     }
   });
 
-export type AppType = typeof userRoutes;
+// Posts listing with pagination and optional filters
+routes.get('/post', async (c) => {
+  try {
+    const url = new URL(c.req.url);
+    const pageParam = url.searchParams.get('page') || '1';
+    const preference = url.searchParams.get('preference') as any | null; // Gender or null
+    const id = url.searchParams.get('id');
+
+    const page = Math.max(parseInt(pageParam, 10) || 1, 1);
+    const limit = 10;
+    const skip = (page - 1) * limit;
+
+    const where: any = {
+      approvalStatus: 'APPROVED',
+      ...(preference ? { creator: { gender: preference } } : {}),
+    };
+
+    // Optional requested post
+    const requestedPost = id
+      ? await db.post.findUnique({
+          where: { id },
+          include: {
+            creator: { select: { id: true, name: true, image: true, gender: true } },
+            _count: { select: { votes: true } },
+            votes: {
+              orderBy: { createdAt: 'desc' },
+              take: 5,
+              include: { voter: { select: { id: true, name: true, image: true } } },
+            },
+          },
+        })
+      : null;
+
+    const [items, total] = await Promise.all([
+      db.post.findMany({
+        where,
+        include: {
+          creator: { select: { id: true, name: true, image: true, gender: true } },
+          _count: { select: { votes: true } },
+          votes: {
+            orderBy: { createdAt: 'desc' },
+            take: 5,
+            include: { voter: { select: { id: true, name: true, image: true } } },
+          },
+        },
+        orderBy: [{ createdAt: 'desc' }],
+        take: limit,
+        skip,
+      }),
+      db.post.count({ where }),
+    ]);
+
+    // Map to expected shape: rename votes->_count.vote and votes array to vote
+    const mapPost = (p: any) => ({
+      ...p,
+      vote: p.votes ?? [],
+      _count: { ...p._count, vote: p._count?.votes ?? 0 },
+    });
+
+    const data = [
+      ...(requestedPost ? [requestedPost] : []),
+      ...items.filter((it) => it.id !== requestedPost?.id),
+    ].map(mapPost);
+
+    const hasMore = skip + limit < total;
+    return c.json({ data, hasMore, nextPage: hasMore ? page + 1 : page });
+  } catch (error: any) {
+    console.error('Error fetching posts:', error);
+    return c.json({ error: 'Failed to fetch posts' }, 500);
+  }
+});
+
+// Single post by id
+routes.get('/post/:id', async (c) => {
+  try {
+    const id = c.req.param('id');
+    if (!id) return c.json({ error: 'Missing id' }, 400);
+
+    const post = await db.post.findUnique({
+      where: { id },
+      include: {
+        creator: { select: { id: true, name: true, image: true, gender: true } },
+        _count: { select: { votes: true } },
+        votes: {
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+          include: { voter: { select: { id: true, name: true, image: true } } },
+        },
+      },
+    });
+
+    if (!post) return c.json({ error: 'Post not found' }, 404);
+
+    const mapped = { ...post, vote: post.votes ?? [], _count: { ...post._count, vote: post._count?.votes ?? 0 } };
+    return c.json({ data: mapped });
+  } catch (error: any) {
+    console.error('Error fetching post:', error);
+    return c.json({ error: 'Failed to fetch post' }, 500);
+  }
+});
+
+// Top creators today (simple heuristic)
+routes.get('/post/top-creators-today', async (c) => {
+  try {
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    const end = new Date();
+    end.setHours(23, 59, 59, 999);
+
+    const todayPosts = await db.post.findMany({
+      where: {
+        approvalStatus: 'APPROVED',
+        updatedAt: { gte: start, lte: end },
+      },
+      include: {
+        creator: { select: { id: true, name: true, image: true, isVerified: true, activityScore: true, gender: true } },
+        _count: { select: { votes: true } },
+      },
+      orderBy: [{ updatedAt: 'desc' }],
+      take: 100,
+    });
+
+    const scored = todayPosts
+      .map((p: any) => ({
+        ...p,
+        engagementScore: (p._count?.votes ?? 0) * 2 + (p.impressions ?? 0) * 0.5 + (p.averageRating ?? 0) * 5,
+      }))
+      .sort((a: any, b: any) => b.engagementScore - a.engagementScore)
+      .slice(0, 3)
+      .map((p: any) => ({
+        id: p.id,
+        caption: p.caption,
+        image: p.image,
+        creator: p.creator,
+        engagementScore: p.engagementScore,
+        totalVotes: p._count?.votes ?? 0,
+        impressions: p.impressions ?? 0,
+      }));
+
+    return c.json({ data: scored });
+  } catch (error: any) {
+    console.error('Error fetching top creators today:', error);
+    return c.json({ error: 'Failed to fetch top creators' }, 500);
+  }
+});
+
+export type AppType = typeof routes;
 
 // Export handlers for Next.js App Router
 export const GET = (req: Request, context: any) => app.fetch(req, context);
