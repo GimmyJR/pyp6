@@ -2,8 +2,6 @@ import { cn } from '@/lib/utils';
 import Providers from '@/providers/provider';
 import type { Metadata } from 'next';
 import { Caveat, Space_Grotesk } from 'next/font/google';
-import 'swiper/css';
-import 'swiper/css/navigation';
 
 import './globals.css';
 
@@ -31,7 +29,6 @@ export default function RootLayout({
   return (
     <html lang='en' className='dark'>
       <head>
-        <link rel='preload' as='image' href='/1.png' fetchPriority='high' />
       </head>
       <body
         className={cn(
